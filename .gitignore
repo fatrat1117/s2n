@@ -11,6 +11,7 @@
 *.info
 *.profraw
 *.tmp
+libcrypto-root
 coverage/html/*
 libcrypto-build/*
 libcrypto-root/*
