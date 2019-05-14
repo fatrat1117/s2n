@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License").
  * You may not use this file except in compliance with the License.
@@ -13,11 +13,24 @@
  * permissions and limitations under the License.
  */
 
+#ifndef _GNU_SOURCE
+# define _GNU_SOURCE
+#endif
+
 #include <s2n.h>
+#include <openssl/x509v3.h>
+#include <openssl/pem.h>
+#include <string.h>
+#include <strings.h>
 
 #include "crypto/s2n_certificate.h"
 #include "utils/s2n_safety.h"
 #include "utils/s2n_mem.h"
+
+static const s2n_authentication_method cert_type_to_auth_method[] = {
+    [S2N_CERT_TYPE_RSA_SIGN] = S2N_AUTHENTICATION_RSA,
+    [S2N_CERT_TYPE_ECDSA_SIGN] = S2N_AUTHENTICATION_ECDSA,
+};
 
 int s2n_cert_public_key_set_rsa_from_openssl(s2n_cert_public_key *public_key, RSA *openssl_rsa)
 {
@@ -163,13 +176,35 @@ struct s2n_cert_chain_and_key *s2n_cert_chain_and_key_new(void)
     GUARD_PTR(s2n_pkey_zero_init(chain_and_key->private_key));
     memset(&chain_and_key->ocsp_status, 0, sizeof(chain_and_key->ocsp_status));
     memset(&chain_and_key->sct_list, 0, sizeof(chain_and_key->sct_list));
-    
+    chain_and_key->san_names = NULL;
+    chain_and_key->x509_cert = NULL;
+
     return chain_and_key;
+}
+
+static int s2n_cert_chain_and_key_set_x509(struct s2n_cert_chain_and_key *chain_and_key, struct s2n_blob *leaf_bytes)
+{
+    const unsigned char *leaf_der = leaf_bytes->data;
+    X509 *cert = d2i_X509(NULL, &leaf_der, leaf_bytes->size);
+    if (!cert) {
+        S2N_ERROR(S2N_ERR_INVALID_PEM);
+    }
+
+    chain_and_key->x509_cert = cert;
+
+    GENERAL_NAMES *san_names = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+    if (san_names == NULL) {
+        /* No SAN extension */
+        return 0;
+    }
+
+    chain_and_key->san_names = san_names;
+
+    return 0;
 }
 
 int s2n_cert_chain_and_key_load_pem(struct s2n_cert_chain_and_key *chain_and_key, const char *chain_pem, const char *private_key_pem)
 {
-
     notnull_check(chain_and_key);
 
     GUARD(s2n_cert_chain_and_key_set_cert_chain(chain_and_key, chain_pem));
@@ -183,6 +218,9 @@ int s2n_cert_chain_and_key_load_pem(struct s2n_cert_chain_and_key *chain_and_key
 
     /* Validate the leaf cert's public key matches the provided private key */
     GUARD(s2n_pkey_match(&public_key, chain_and_key->private_key));
+
+    /* TODO this will be removed once we add native hostname comparison to s2n. */
+    GUARD(s2n_cert_chain_and_key_set_x509(chain_and_key, &chain_and_key->cert_chain->head->raw));
 
     return 0;
 }
@@ -213,7 +251,15 @@ int s2n_cert_chain_and_key_free(struct s2n_cert_chain_and_key *cert_and_key)
         GUARD(s2n_pkey_free(cert_and_key->private_key));
         GUARD(s2n_free_object((uint8_t **)&cert_and_key->private_key, sizeof(s2n_cert_private_key)));
     }
- 
+
+    if (cert_and_key->x509_cert) {
+        X509_free(cert_and_key->x509_cert);
+    }
+
+    if (cert_and_key->san_names) {
+        GENERAL_NAMES_free(cert_and_key->san_names);
+    }
+
     GUARD(s2n_free(&cert_and_key->ocsp_status));
     GUARD(s2n_free(&cert_and_key->sct_list));
 
@@ -229,7 +275,7 @@ int s2n_send_cert_chain(struct s2n_stuffer *out, struct s2n_cert_chain *chain)
 
     struct s2n_cert *cur_cert = chain->head;
     while (cur_cert) {
-        notnull_check(cur_cert); 
+        notnull_check(cur_cert);
         GUARD(s2n_stuffer_write_uint24(out, cur_cert->raw.size));
         GUARD(s2n_stuffer_write_bytes(out, cur_cert->raw.data, cur_cert->raw.size));
         cur_cert = cur_cert->next;
@@ -238,8 +284,60 @@ int s2n_send_cert_chain(struct s2n_stuffer *out, struct s2n_cert_chain *chain)
     return 0;
 }
 
-int s2n_send_empty_cert_chain(struct s2n_stuffer *out) {
+int s2n_send_empty_cert_chain(struct s2n_stuffer *out)
+{
     notnull_check(out);
     GUARD(s2n_stuffer_write_uint24(out, 0));
     return 0;
 }
+
+static int s2n_does_cert_san_match_hostname(struct s2n_cert_chain_and_key *cert, const char *hostname)
+{
+    GENERAL_NAMES *san_names = cert->san_names;
+    if (san_names == NULL) {
+        return 0;
+    }
+
+    const size_t hostname_len = strnlen(hostname, S2N_MAX_SERVER_NAME);
+    for (int i = 0; i < sk_GENERAL_NAME_num(san_names); i++) {
+        GENERAL_NAME *san_name = sk_GENERAL_NAME_value(san_names, i);
+        if (!san_name) {
+            continue;
+        }
+
+        /* we only care about DNS entries */
+        if (san_name->type == GEN_DNS) {
+            unsigned char *san_str = san_name->d.dNSName->data;
+            const size_t san_str_len = san_name->d.dNSName->length;
+            /* Per https://www.openssl.org/docs/man1.1.0/man3/ASN1_STRING_data.html there may
+             * be embedded NULLs inside of the SAN string. The strncasecmp will return false for
+             * that case.
+             */
+            const int match = !!((hostname_len == san_str_len) && (strncasecmp(hostname, (const char *) san_str, san_str_len) == 0));
+            if (match) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+int s2n_cert_chain_and_key_matches_name(struct s2n_cert_chain_and_key *chain_and_key, const char *name)
+{
+    if (s2n_does_cert_san_match_hostname(chain_and_key, name)) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * Note that this assumes there is a 1:1 relationship between cert type and auth method.
+ * This interface will need to be updated if s2n adds support for more than one auth method per certificate type.
+ */
+s2n_authentication_method s2n_cert_chain_and_key_get_auth_method(struct s2n_cert_chain_and_key *chain_and_key)
+{
+    return cert_type_to_auth_method[chain_and_key->cert_chain->head->cert_type];
+}
+

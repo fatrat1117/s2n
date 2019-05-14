@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License").
  * You may not use this file except in compliance with the License.
@@ -151,6 +151,23 @@ int s2n_conn_update_required_handshake_hashes(struct s2n_connection *conn)
         GUARD(s2n_handshake_require_hash(&conn->handshake, hash_alg));
         break;
     }
+    }
+
+    return 0;
+}
+
+int s2n_conn_find_name_matching_certs(struct s2n_connection *conn)
+{
+    const char *name = conn->server_name;
+    struct s2n_array *certs = conn->config->cert_and_key_pairs;
+    for (int i = 0; i < s2n_array_num_elements(certs); i++) {
+        struct s2n_cert_chain_and_key *chain_and_key = *((struct s2n_cert_chain_and_key**) s2n_array_get(certs, i));
+        s2n_authentication_method auth_method = s2n_cert_chain_and_key_get_auth_method(chain_and_key);
+        if (s2n_cert_chain_and_key_matches_name(chain_and_key, name) &&
+                !conn->handshake_params.sni_matching_certs[auth_method]) {
+            conn->handshake_params.sni_matching_certs[auth_method] = chain_and_key;
+            conn->handshake_params.sni_match_exists = 1;
+        }
     }
 
     return 0;
